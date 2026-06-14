@@ -12,19 +12,13 @@ _get(){ curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 10 -m 30 "$1?$2"; }
 _post(){ curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 10 -m 30 -H "Content-Type: application/json;charset=UTF-8" -d "$2" "$1${3:+?$3}"; }
 _extract(){ echo "$2"|grep -oP "${1//./\\.}\s*=\s*\"?\K[^\"';]+"|head -1; }
 _base_req(){ jq -n --arg u "$UIN" --arg s "$SID" --arg k "$SKEY" --arg d "$D" '{Uin:($u|tonumber),Sid:$s,Skey:$k,DeviceID:$d}'; }
-_sync_keys(){ jq -r '[.SyncKey.List[]?|"\(.Key)_\(.Val)"]|join("|")'; }
+_sync_keys(){ jq -c '[.SyncKey.List[]?|{Key,Val}]'; }
 
 _load(){
   [ -f "$F" ] || return 1
-  UIN=$(jq -r '.uin//""' "$F")
-  SID=$(jq -r '.sid//""' "$F")
-  SKEY=$(jq -r '.skey//""' "$F")
-  PASS_TICKET=$(jq -r '.pass_ticket//""' "$F")
-  SYNC_KEY=$(jq -r '.sync_key//""' "$F")
-  D=$(jq -r '.device_id//""' "$F")
-  BASE_HOST=$(jq -r '.base_host//""' "$F")
-  BASE_ORIGIN=$(jq -r '.base_origin//""' "$F")
-  SELF_ID=$(jq -r '.self_id//""' "$F")
+  local data
+  data=$(jq -r '[.uin,.sid,.skey,.pass_ticket,.sync_key,.device_id,.base_host,.base_origin,.self_id]|@tsv' "$F")
+  IFS=$'\t' read -r UIN SID SKEY PASS_TICKET SYNC_KEY D BASE_HOST BASE_ORIGIN SELF_ID <<< "$data"
 }
 _save(){
   local t=$(mktemp); chmod 600 "$t"
@@ -95,7 +89,7 @@ _check(){
     ph="webpush.${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
   else ph="webpush.weixin.qq.com"; fi
   local sr=$(_get "https://$ph/cgi-bin/mmwebwx-bin/synccheck" \
-    "r=$(date +%s)&sid=$SID&uin=$UIN&skey=$SKEY&deviceid=$D&synckey=$SYNC_KEY&_=$(date +%s)")
+    "r=$(date +%s)&sid=$SID&uin=$UIN&skey=$SKEY&deviceid=$D&synckey=$(echo "$SYNC_KEY"|jq -r '[.[]|"\(.Key)_\(.Val)"]|join("|")')&_=$(date +%s)")
   local rc=$(echo "$sr"|grep -oP 'retcode\s*[=:]\s*"?\K\d+')
   [ "$rc" = 1100 ]||[ "$rc" = 1101 ] || return 0
   return 1
@@ -114,7 +108,8 @@ login(){
     qrencode -t ANSIUTF8 "$qr" 2>/dev/null || qrencode -t UTF8 "$qr" 2>/dev/null || echo "$qr" >&2
   else echo "welite: scan $qr" >&2; fi
 
-  local redir="" wc eu="${u//%/%25}"; eu="${eu//+/%2B}"; eu="${eu//\//%2F}"; eu="${eu//=/%3D}"
+  local redir="" wc eu
+  eu=$(printf '%s' "$u" | jq -sRr @uri)
   while [ -z "$redir" ]; do
     sleep 2
     r=$(_get "https://$W/cgi-bin/mmwebwx-bin/login" "tip=0&uuid=$eu&loginicon=true&r=$((~$(date +%s)))")
@@ -158,7 +153,7 @@ sync(){
   while [ "$STOP" = 0 ]; do
     local sr rc sl
     sr=$(_get "https://$ph/cgi-bin/mmwebwx-bin/synccheck" \
-      "r=$(date +%s)&sid=$SID&uin=$UIN&skey=$SKEY&deviceid=$D&synckey=$SYNC_KEY&_=$(date +%s)")
+      "r=$(date +%s)&sid=$SID&uin=$UIN&skey=$SKEY&deviceid=$D&synckey=$(echo "$SYNC_KEY"|jq -r '[.[]|"\(.Key)_\(.Val)"]|join("|")')&_=$(date +%s)")
     if [ -z "$sr" ]; then
       sleep $((delay>30?30:delay)); delay=$((delay*2)); continue
     fi
@@ -168,8 +163,7 @@ sync(){
     case "$rc" in 1100|1101) echo "welite: sync: session expired" >&2; break ;; esac
     [ "$sl" = 0 ] && continue
 
-    local sko=$(echo "$SYNC_KEY"|awk -F'|' '{for(i=1;i<=NF;i++){split($i,a,"_");printf "%s{\"Key\":%d,\"Val\":%d}",(i>1?",":""),a[1],a[2]}}')
-    local sb=$(jq -n --arg u "$UIN" --arg s "$SID" --arg k "$SKEY" --arg d "$D" --argjson skl "[${sko}]" \
+    local sb=$(jq -n --arg u "$UIN" --arg s "$SID" --arg k "$SKEY" --arg d "$D" --argjson skl "$SYNC_KEY" \
       '{BaseRequest:{Uin:($u|tonumber),Sid:$s,Skey:$k,DeviceID:$d},SyncKey:{Count:($skl|length),List:$skl},rr:'$((~$(date +%s)))'}')
     sr=$(_post "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxsync" "$sb" "sid=$SID&skey=$SKEY&pass_ticket=$PASS_TICKET&lang=zh_CN")
     [ -z "$sr" ] && { sleep 1; continue; }
