@@ -1,6 +1,6 @@
 #!/bin/bash
 # welite.sh — WeChat Web API shell client
-S=./welite.sock J=./welite_cookies.txt C=./welite_contacts.json F=${2:-./session.json} E=./welite_extspam.txt
+S=./welite.sock J=./welite_cookies.txt C=./welite_contacts.json F=${2:-./session.json} E=./welite_extspam.txt T=./welite_media
 A="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/111.0.0.0 Safari/537.36"
 W=login.wx.qq.com
 declare -A CN_ CN_R
@@ -13,6 +13,61 @@ _post(){ curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 10 -m 30 -H "Content-
 _extract(){ echo "$2"|grep -oP "${1//./\\.}\s*=\s*\"?\K[^\"';]+"|head -1; }
 _base_req(){ jq -n --arg u "$UIN" --arg s "$SID" --arg k "$SKEY" --arg d "$D" '{Uin:($u|tonumber),Sid:$s,Skey:$k,DeviceID:$d}'; }
 _sync_keys(){ jq -c '[.SyncKey.List[]?|{Key,Val}]'; }
+_file_host(){
+  [[ "$1" =~ ^([^.]+)(\.qq\.com|\.wechat\.com)$ ]] && echo "file.${BASH_REMATCH[1]}${BASH_REMATCH[2]}" || echo "file.weixin.qq.com"
+}
+
+# emoji name lookup (from emoji_names.txt: index<TAB>name)
+_emoji_name(){
+  local i="$1"
+  awk -F'\t' -v idx="$i" '$1==idx{print $2; exit}' emoji_names.txt 2>/dev/null || echo "表情"
+}
+
+_download_img(){
+  local msgid="$1" dest="$2" thumb="$3"
+  local params="MsgID=$msgid&skey=$SKEY"
+  [ "$thumb" = 1 ] && params="$params&type=slave"
+  curl -s -b "$J" -A "$A" --connect-timeout 10 -m 30 -o "$dest" \
+    "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxgetmsgimg?$params"
+}
+
+_download_media(){
+  local from="$1" mid="$2" name="$3" dest="$4"
+  local wdt=$(grep 'webwx_data_ticket' "$J" | head -1 | awk '{print $NF}')
+  local fh=$(_file_host "$BASE_HOST")
+  curl -s -b "$J" -A "$A" --connect-timeout 10 -m 60 -o "$dest" \
+    "https://$fh/cgi-bin/mmwebwx-bin/webwxgetmedia?sender=$from&mediaid=$mid&filename=$name&fromuser=$SELF_ID&pass_ticket=$PASS_TICKET&webwx_data_ticket=$wdt"
+}
+
+_download_video(){
+  local msgid="$1" dest="$2"
+  curl -s -b "$J" -A "$A" --connect-timeout 10 -m 120 -H "Range: bytes=0-" -o "$dest" \
+    "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxgetvideo?MsgID=$msgid&skey=$SKEY"
+}
+
+_download_voice(){
+  local msgid="$1" dest="$2"
+  curl -s -b "$J" -A "$A" --connect-timeout 10 -m 60 -H "Range: bytes=0-" -o "$dest" \
+    "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxgetvoice?MsgID=$msgid&skey=$SKEY"
+}
+
+_notify(){
+  local title="$1" body="$2" icon="$3"
+  local ic=""
+  [ -f "$icon" ] && ic="$(readlink -f "$icon")"
+  if command -v fyi &>/dev/null; then
+    [ -n "$ic" ] && fyi -i "$ic" -- "$title" "$body" 2>/dev/null &
+    [ -z "$ic" ] && fyi -- "$title" "$body" 2>/dev/null &
+  elif command -v notify-send &>/dev/null; then
+    [ -n "$ic" ] && notify-send -i "$ic" -- "$title" "$body" 2>/dev/null &
+    [ -z "$ic" ] && notify-send -- "$title" "$body" 2>/dev/null &
+  fi
+}
+
+_preview(){
+  local file="$1"
+  chafa --size=20 "$file" 2>/dev/null
+}
 
 _load(){
   [ -f "$F" ] || return 1
@@ -173,21 +228,104 @@ sync(){
 
     while IFS= read -r m; do
       [ -z "$m" ] && continue
-      [ "$(jq -r '.MsgType//0'<<<"$m")" != 1 ] && continue
       [ "$(jq -r '.FromUserName//""'<<<"$m")" = "$SELF_ID" ] && continue
       local mid=$(jq -r '.MsgId//""'<<<"$m")
       [ -n "$mid" ] && [ "${SEEN[$mid]}" ] && continue
       [ -n "$mid" ] && SEEN[$mid]=1
+      mkdir -p "$T"
+
       local fr=$(jq -r '.FromUserName//""'<<<"$m")
-      local tx=$(sed 's/<br\/>/\n/g;s/<[^>]*>//g;s/&amp;/\&/g;s/&lt;/</g;s/&gt;/>/g;s/&quot;/"/g'<<<"$(jq -r '.Content//""'<<<"$m")")
+      local mt=$(jq -r '.MsgType//0'<<<"$m")
       local sn=$(_name "$fr")
+      local tx content mediaid fname
+
+      case "$mt" in
+        1) # text
+          tx=$(sed 's/<br\/>/\n/g;s/<[^>]*>//g;s/&amp;/\&/g;s/&lt;/</g;s/&gt;/>/g;s/&quot;/"/g'<<<"$(jq -r '.Content//""'<<<"$m")")
+          # replace emoji <span class="emoji emojiN"> with [name] in text
+          tx=$(sed -r 's/<span class="emoji emoji([0-9]+)"><\/span>/[emoji:\1]/g'<<<"$tx")
+          while [[ "$tx" == *"[emoji:"* ]]; do
+            local eid="${tx#*[emoji:}"; eid="${eid%%]*}"
+            [ -z "$eid" ] && break
+            local en=$(_emoji_name "$eid")
+            tx="${tx//\[emoji:$eid\]/[$en]}"
+          done
+          ;;
+        3) # image
+          local f="$T/img_$mid.jpg"
+          _download_img "$mid" "$f" 0
+          [ ! -s "$f" ] && _download_img "$mid" "$f" 1
+          if [ -s "$f" ]; then
+            _preview "$f"
+            _notify "$sn" "[Image]" "$f"
+            tx="[Image]"
+          else
+            tx="[Image]"
+          fi
+          ;;
+        47) # emoticon (try full-size only; official stickers have no downloadable asset)
+          local f="$T/emo_$mid.png"
+          _download_img "$mid" "$f" 0
+          if [ -s "$f" ]; then
+            _preview "$f"
+            _notify "$sn" "[Emoticon]" "$f"
+          fi
+          tx="[Emoticon]"
+          ;;
+         43) # video — download thumbnail, MsgID for download
+           local vf="$T/vid_$mid.jpg"
+           _download_img "$mid" "$vf" 1
+           if [ -s "$vf" ]; then
+             _preview "$vf"
+             _notify "$sn" "[Video]" "$vf"
+           fi
+           fname=$(jq -r '.FileName//""'<<<"$m")
+           [ -z "$fname" ] && fname=$(jq -r '.EncryFileName//""'<<<"$m")
+           tx="[Video] MsgID=$mid"
+           [ -n "$fname" ] && tx="$tx file=$fname"
+           ;;
+         34) # voice
+           fname=$(jq -r '.FileName//""'<<<"$m")
+           tx="[Voice] MsgID=$mid"
+           [ -n "$fname" ] && tx="$tx file=$fname"
+           ;;
+        49) # appmsg / file
+          local amt=$(jq -r '.AppMsgType//0'<<<"$m")
+          local url=$(jq -r '.Url//""'<<<"$m")
+          content=$(jq -r '.Content//""'<<<"$m")
+          mediaid=$(jq -r '.MediaId//""'<<<"$m")
+          # file attachment (AppMsgType=6)
+          if [ "$amt" = 6 ] && [ -z "$mediaid" ]; then
+            mediaid=$(sed -n 's/.*<attachid>\([^<]*\)<\/attachid>.*/\1/p'<<<"$content")
+          fi
+          fname=$(jq -r '.FileName//""'<<<"$m")
+          [ -z "$fname" ] && fname=$(sed -n 's/.*<title><!\[CDATA\[\([^\]]*\)\]\]><\/title>.*/\1/p'<<<"$content")
+          [ -z "$fname" ] && fname=$(sed -n 's/.*<title>\([^<]*\)<\/title>.*/\1/p'<<<"$content")
+          if [ -n "$url" ] && [ "$url" != "null" ]; then
+            tx="[Link] $url"
+          elif [ -n "$mediaid" ] && [ "$mediaid" != "null" ]; then
+            tx="[File] mid=$mediaid file=$fname"
+          else
+            tx="[AppMsg]"
+          fi
+          ;;
+        62) # microvideo
+          mediaid=$(jq -r '.MediaId//""'<<<"$m")
+          tx="[MicroVideo] mid=$mediaid"
+          ;;
+        *) tx="[Type:$mt]" ;;
+      esac
+
       if [[ "$fr" == @@* ]]; then
-        local mi=""
-        [[ "$tx" == @*:* ]] && { mi="${tx#@}"; mi="${mi%%:*}"; tx="${tx#*:}"; tx="${tx#:}"; tx="${tx## }"; }
-        echo "[$sn${mi:+/$(_name "$mi")}] $tx" >&2
+        if [ "$mt" = 1 ] && [[ "$tx" == @*:* ]]; then
+          local mi="${tx#@}"; mi="${mi%%:*}"; tx="${tx#*:}"; tx="${tx#:}"; tx="${tx## }"
+          echo "[$sn/$(_name "$mi")] $tx" >&2
+        else
+          echo "[$sn] $tx" >&2
+        fi
       else
         echo "[$sn] $tx" >&2
-        notify-send -- "$sn" "$tx" 2>/dev/null &
+        _notify "$sn" "$tx" "" 
       fi
       [ ${#SEEN[@]} -gt $SEEN_MAX ] && { local ks=("${!SEEN[@]}"); for k in "${ks[@]::$(( ${#ks[@]} - SEEN_MAX/2 ))}"; do unset SEEN[$k]; done; }
     done <<< "$(echo "$sr"|jq -c '.AddMsgList[]?')"
@@ -204,6 +342,120 @@ send(){
   [ "$(jq -r '.BaseResponse.Ret//-1'<<<"$r")" = 0 ]
 }
 
+_sendfile(){
+  local mid="$1" name="$2" size="$3" ext="$4" to="$5"
+  local cid=$(( $(date +%s%3N) ))
+  local br=$(_base_req)
+  local content="<appmsg appid='wxeb7ec651dd0aefa9' sdkver=''><title>$name</title><des></des><action></action><type>6</type><content></content><url></url><lowurl></lowurl><appattach><totallen>$size</totallen><attachid>$mid</attachid><fileext>$ext</fileext></appattach><extinfo></extinfo></appmsg>"
+  local b=$(jq -n --argjson br "$br" --argjson cid "$cid" \
+    --arg x "$content" --arg f "$SELF_ID" --arg t "$to" \
+    '{BaseRequest:$br,Scene:0,Msg:{Type:6,Content:$x,FromUserName:$f,ToUserName:$t,LocalID:$cid,ClientMsgId:$cid}}')
+  local r=$(_post "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxsendappmsg" "$b" "pass_ticket=$PASS_TICKET&fun=async&f=json&lang=zh_CN")
+  [ "$(jq -r '.BaseResponse.Ret//-1'<<<"$r")" = 0 ]
+}
+
+_sendpic(){
+  local mid="$1" to="$2"
+  local cid=$(( $(date +%s%3N) ))
+  local br=$(_base_req)
+  local b=$(jq -n --argjson br "$br" --argjson cid "$cid" --arg mid "$mid" --arg f "$SELF_ID" --arg t "$to" \
+    '{BaseRequest:$br,Scene:0,Msg:{Type:3,MediaId:$mid,FromUserName:$f,ToUserName:$t,LocalID:$cid,ClientMsgId:$cid}}')
+  local r=$(_post "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxsendmsgimg" "$b" "pass_ticket=$PASS_TICKET&fun=async&f=json&lang=zh_CN")
+  [ "$(jq -r '.BaseResponse.Ret//-1'<<<"$r")" = 0 ]
+}
+
+_sendvideo(){
+  local mid="$1" to="$2"
+  local cid=$(( $(date +%s%3N) ))
+  local br=$(_base_req)
+  local b=$(jq -n --argjson br "$br" --argjson cid "$cid" --arg mid "$mid" --arg f "$SELF_ID" --arg t "$to" \
+    '{BaseRequest:$br,Scene:0,Msg:{Type:43,MediaId:$mid,FromUserName:$f,ToUserName:$t,LocalID:$cid,ClientMsgId:$cid}}')
+  local r=$(_post "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxsendvideomsg" "$b" "pass_ticket=$PASS_TICKET&fun=async&f=json&lang=zh_CN")
+  [ "$(jq -r '.BaseResponse.Ret//-1'<<<"$r")" = 0 ]
+}
+
+_sendemoticon(){
+  local mid="$1" to="$2"
+  local cid=$(( $(date +%s%3N) ))
+  local br=$(_base_req)
+  local b=$(jq -n --argjson br "$br" --argjson cid "$cid" --arg mid "$mid" --arg f "$SELF_ID" --arg t "$to" \
+    '{BaseRequest:$br,Scene:0,Msg:{Type:47,EmojiFlag:2,MediaId:$mid,FromUserName:$f,ToUserName:$t,LocalID:$cid,ClientMsgId:$cid}}')
+  local r=$(_post "$BASE_ORIGIN/cgi-bin/mmwebwx-bin/webwxsendemoticon" "$b" "pass_ticket=$PASS_TICKET&fun=sys&lang=zh_CN")
+  [ "$(jq -r '.BaseResponse.Ret//-1'<<<"$r")" = 0 ]
+}
+
+_upload(){
+  local file="$1" to="$2" CHUNK=$((512*1024))
+  local fname="$(basename "$file")"
+  local fsize="$(stat -c%s "$file")"
+  local fext="${fname##*.}"; fext="${fext,,}"
+  local fmime="application/octet-stream"
+  case "$fext" in
+    txt) fmime="text/plain";;
+    pdf) fmime="application/pdf";;
+    jpg|jpeg) fmime="image/jpeg";;
+    png) fmime="image/png";;
+    gif) fmime="image/gif";;
+    mp4) fmime="video/mp4";;
+    zip) fmime="application/zip";;
+  esac
+  local mediatype="doc"
+  case "$fext" in bmp|jpeg|jpg|png) mediatype="pic";; mp4) mediatype="video";; esac
+  local fmd5="$(md5sum "$file" | cut -d' ' -f1)"
+  local cid=$(( $(date +%s%3N) ))
+  local br=$(_base_req)
+  local umr=$(jq -n --argjson br "$br" --argjson cid "$cid" --argjson size "$fsize" \
+    --arg f "$SELF_ID" --arg t "$to" --arg md5 "$fmd5" \
+    '{UploadType:2,BaseRequest:$br,ClientMediaId:$cid,TotalLen:$size,StartPos:0,DataLen:$size,MediaType:4,FromUserName:$f,ToUserName:$t,FileMd5:$md5}')
+  local wdt=$(grep 'webwx_data_ticket' "$J" | head -1 | awk '{print $NF}')
+  local fh=$(_file_host "$BASE_HOST")
+  local chunks=$(( (fsize + CHUNK - 1) / CHUNK ))
+
+  # single chunk (<= 512KB)
+  if [ "$chunks" -le 1 ]; then
+    local rv=$(curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 30 -m 120 \
+      -F "name=$fname" -F "type=$fmime" \
+      -F "lastModifiedDate=$(date -R)" -F "size=$fsize" \
+      -F "mediatype=$mediatype" -F "uploadmediarequest=$umr" \
+      -F "webwx_data_ticket=$wdt" -F "pass_ticket=$PASS_TICKET" \
+      -F "filename=@$file;filename=$fname" \
+      "https://$fh/cgi-bin/mmwebwx-bin/webwxuploadmedia?f=json")
+    local ret=$(jq -r '.BaseResponse.Ret//-1'<<<"$rv")
+    [ "$ret" != 0 ] && { echo "ERR: upload Ret=$ret" >&2; return 1; }
+    local mid=$(jq -r '.MediaId'<<<"$rv")
+    echo "$fname"$'\t'"$fsize"$'\t'"$fext"$'\t'"$mid"
+    return 0
+  fi
+
+  # chunked upload (> 512KB)
+  local i=0 offset=0 rv mid tmp
+  while [ "$i" -lt "$chunks" ]; do
+    local remain=$((fsize - offset))
+    local clen=$((remain < CHUNK ? remain : CHUNK))
+    tmp=$(mktemp)
+    tail -c +$((offset+1)) "$file" 2>/dev/null | head -c "$clen" > "$tmp"
+    local umr_chunk=$(jq -n --argjson br "$br" --argjson cid "$cid" --argjson size "$fsize" \
+      --arg f "$SELF_ID" --arg t "$to" --arg md5 "$fmd5" \
+      --argjson start "$offset" --argjson dlen "$clen" \
+      '{UploadType:2,BaseRequest:$br,ClientMediaId:$cid,TotalLen:$size,StartPos:$start,DataLen:$dlen,MediaType:4,FromUserName:$f,ToUserName:$t,FileMd5:$md5}')
+    rv=$(curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 30 -m 120 \
+      -F "id=WU_FILE_0" -F "name=$fname" -F "type=$fmime" \
+      -F "lastModifiedDate=$(date -R)" -F "size=$fsize" \
+      -F "chunk=$i" -F "chunks=$chunks" \
+      -F "mediatype=$mediatype" -F "uploadmediarequest=$umr_chunk" \
+      -F "webwx_data_ticket=$wdt" -F "pass_ticket=$PASS_TICKET" \
+      -F "filename=@$tmp;filename=$fname" \
+      "https://$fh/cgi-bin/mmwebwx-bin/webwxuploadmedia?f=json")
+    rm -f "$tmp"
+    local ret=$(jq -r '.BaseResponse.Ret//-1'<<<"$rv")
+    [ "$ret" != 0 ] && { echo "ERR: chunk $i/$chunks Ret=$ret" >&2; return 1; }
+    mid=$(jq -r '.MediaId'<<<"$rv")
+    i=$((i+1))
+    offset=$((offset + clen))
+  done
+  echo "$fname"$'\t'"$fsize"$'\t'"$fext"$'\t'"$mid"
+}
+
 handle(){
   _load
   _build_cache
@@ -211,11 +463,34 @@ handle(){
   [ -z "$c" ] && { echo ERR; exit; }
   case "$c" in
     LIST) jq -r '.[]|if .remark!="" then .remark elif .nickname!="" then .nickname else .username end' "$C" 2>/dev/null ;;
+    DOWNLOAD*)
+      local c2="${c#DOWNLOAD }"; local mid="${c2%% *}"; local fname="${c2#* }"
+      [ -z "$mid" ] || [ -z "$fname" ] && { echo ERR; exit; }
+      local ext="${fname##*.}"
+      case "${ext,,}" in
+        mp4) _download_video "$mid" "$fname" ;;
+        mp3|wav|amr|silk) _download_voice "$mid" "$fname" ;;
+        *) _download_media "$SELF_ID" "$mid" "$fname" "$fname" ;;
+      esac
+      [ -f "$fname" ] && echo OK || echo ERR ;; 
+    SENDFILE*)
+      local n="${c#SENDFILE }"; n="${n%% *}"; local fp="${c#SENDFILE $n }"; fp="${fp## }"
+      { [ -z "$n" ] || [ -z "$fp" ] || [ ! -f "$fp" ]; } && { echo ERR; exit; }
+      local u=$(_resolve "$n"); [ -z "$u" ] && { echo ERR; exit; }
+      local info=$(_upload "$fp" "$u")
+      [ $? != 0 ] && { echo ERR; exit; }
+      IFS=$'\t' read -r fname fsize fext mid <<< "$info"
+      case "$fext" in
+        bmp|jpeg|jpg|png) _sendpic "$mid" "$u" && echo OK || echo ERR ;;
+        gif) _sendemoticon "$mid" "$u" && echo OK || echo ERR ;;
+        mp4) _sendvideo "$mid" "$u" && echo OK || echo ERR ;;
+        *) _sendfile "$mid" "$fname" "$fsize" "$fext" "$u" && echo OK || echo ERR ;;
+      esac ;;   
     SEND*)
       local n="${c#SEND }"; n="${n%% *}"; local x="${c#SEND $n }"; x="${x## }"
       [ -z "$n" ]||[ -z "$x" ] && { echo ERR; exit; }
       local u=$(_resolve "$n"); [ -z "$u" ] && { echo ERR; exit; }
-      send "$u" "$x" && echo OK || echo ERR ;;
+      send "$u" "$x" && echo OK || echo ERR ;;   
     *) echo ERR ;;
   esac
 }
@@ -242,12 +517,26 @@ daemon(){
 cmd(){ echo "$1"|socat - UNIX-CONNECT:"$S" 2>/dev/null; }
 client(){
   [ $# -lt 1 ]||[ "$1" = -h ]||[ "$1" = --help ]&&{
-    echo "Usage: $0 -d               (daemon)"
-    echo "       $0 <nick> <text..>  (send)"
-    echo "       $0 -l                (list)"; exit 1; }
+    echo "Usage: $0 -d                   (daemon)"
+    echo "       $0 <nick> <text..>      (send text)"
+    echo "       $0 -f <file> <nick>      (send file)"
+    echo "       $0 -D <MediaId> <name>   (download media)"
+    echo "       $0 -l                    (list)"; exit 1; }
   [ "$1" = -l ] && { cmd LIST; return; }
+  [ "$1" = -D ] && {
+    [ $# -lt 3 ] && { echo "welite: -D <MediaId> <FileName>" >&2; exit 1; }
+    local r=$(cmd "DOWNLOAD $2 $3")
+    [ "${r:0:2}" = OK ] && echo "downloaded: $3" && return 0
+    echo "welite: $r" >&2; return 1; }
+  [ "$1" = -f ] && {
+    [ $# -lt 3 ] || [ ! -f "$2" ] && { echo "welite: -f <file> <nick>" >&2; exit 1; }
+    local r=$(cmd "SENDFILE $3 $2")
+    [ "${r:0:2}" = OK ] && echo "sent: $2 -> $3" && return 0
+    echo "welite: $r" >&2; return 1; }
   [ $# -lt 2 ] && { echo "welite: <nick> <text>" >&2; exit 1; }
-  local r=$(cmd "SEND $1 ${*:2}"); [ "${r:0:2}" = OK ]
+  local r=$(cmd "SEND $1 ${*:2}")
+  [ "${r:0:2}" = OK ] && return 0
+  echo "welite: $r" >&2; return 1
 }
 
 case "$1" in
