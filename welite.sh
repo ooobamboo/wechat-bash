@@ -55,13 +55,8 @@ _notify(){
   local title="$1" body="$2" icon="$3"
   local ic=""
   [ -f "$icon" ] && ic="$(readlink -f "$icon")"
-  if command -v fyi &>/dev/null; then
-    [ -n "$ic" ] && fyi -i "$ic" -- "$title" "$body" 2>/dev/null &
-    [ -z "$ic" ] && fyi -- "$title" "$body" 2>/dev/null &
-  elif command -v notify-send &>/dev/null; then
-    [ -n "$ic" ] && notify-send -i "$ic" -- "$title" "$body" 2>/dev/null &
-    [ -z "$ic" ] && notify-send -- "$title" "$body" 2>/dev/null &
-  fi
+  [ -n "$ic" ] && fyi -i "$ic" -- "$title" "$body" 2>/dev/null &
+  [ -z "$ic" ] && fyi -- "$title" "$body" 2>/dev/null &
 }
 
 _preview(){
@@ -404,55 +399,52 @@ _upload(){
   local fmd5="$(md5sum "$file" | cut -d' ' -f1)"
   local cid=$(( $(date +%s%3N) ))
   local br=$(_base_req)
-  local umr=$(jq -n --argjson br "$br" --argjson cid "$cid" --argjson size "$fsize" \
-    --arg f "$SELF_ID" --arg t "$to" --arg md5 "$fmd5" \
-    '{UploadType:2,BaseRequest:$br,ClientMediaId:$cid,TotalLen:$size,StartPos:0,DataLen:$size,MediaType:4,FromUserName:$f,ToUserName:$t,FileMd5:$md5}')
   local wdt=$(grep 'webwx_data_ticket' "$J" | head -1 | awk '{print $NF}')
   local fh=$(_file_host "$BASE_HOST")
   local chunks=$(( (fsize + CHUNK - 1) / CHUNK ))
+  [ "$chunks" -le 0 ] && chunks=1 
 
-  # single chunk (<= 512KB)
-  if [ "$chunks" -le 1 ]; then
-    local rv=$(curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 30 -m 120 \
-      -F "name=$fname" -F "type=$fmime" \
-      -F "lastModifiedDate=$(date -R)" -F "size=$fsize" \
-      -F "mediatype=$mediatype" -F "uploadmediarequest=$umr" \
-      -F "webwx_data_ticket=$wdt" -F "pass_ticket=$PASS_TICKET" \
-      -F "filename=@$file;filename=$fname" \
-      "https://$fh/cgi-bin/mmwebwx-bin/webwxuploadmedia?f=json")
-    local ret=$(jq -r '.BaseResponse.Ret//-1'<<<"$rv")
-    [ "$ret" != 0 ] && { echo "ERR: upload Ret=$ret" >&2; return 1; }
-    local mid=$(jq -r '.MediaId'<<<"$rv")
-    echo "$fname"$'\t'"$fsize"$'\t'"$fext"$'\t'"$mid"
-    return 0
-  fi
-
-  # chunked upload (> 512KB)
-  local i=0 offset=0 rv mid tmp
+  local i=0 offset=0 rv mid tmp curl_opts
   while [ "$i" -lt "$chunks" ]; do
     local remain=$((fsize - offset))
     local clen=$((remain < CHUNK ? remain : CHUNK))
-    tmp=$(mktemp)
-    tail -c +$((offset+1)) "$file" 2>/dev/null | head -c "$clen" > "$tmp"
-    local umr_chunk=$(jq -n --argjson br "$br" --argjson cid "$cid" --argjson size "$fsize" \
+    
+    local umr=$(jq -n --argjson br "$br" --argjson cid "$cid" --argjson size "$fsize" \
       --arg f "$SELF_ID" --arg t "$to" --arg md5 "$fmd5" \
       --argjson start "$offset" --argjson dlen "$clen" \
       '{UploadType:2,BaseRequest:$br,ClientMediaId:$cid,TotalLen:$size,StartPos:$start,DataLen:$dlen,MediaType:4,FromUserName:$f,ToUserName:$t,FileMd5:$md5}')
-    rv=$(curl -s -b "$J" -c "$J" -A "$A" --connect-timeout 30 -m 120 \
-      -F "id=WU_FILE_0" -F "name=$fname" -F "type=$fmime" \
-      -F "lastModifiedDate=$(date -R)" -F "size=$fsize" \
-      -F "chunk=$i" -F "chunks=$chunks" \
-      -F "mediatype=$mediatype" -F "uploadmediarequest=$umr_chunk" \
-      -F "webwx_data_ticket=$wdt" -F "pass_ticket=$PASS_TICKET" \
-      -F "filename=@$tmp;filename=$fname" \
-      "https://$fh/cgi-bin/mmwebwx-bin/webwxuploadmedia?f=json")
-    rm -f "$tmp"
-    local ret=$(jq -r '.BaseResponse.Ret//-1'<<<"$rv")
-    [ "$ret" != 0 ] && { echo "ERR: chunk $i/$chunks Ret=$ret" >&2; return 1; }
-    mid=$(jq -r '.MediaId'<<<"$rv")
+
+    curl_opts=(
+      -s -b "$J" -c "$J" -A "$A" --connect-timeout 30 -m 120
+      -F "name=$fname" -F "type=$fmime"
+      -F "lastModifiedDate=$(date -R)" -F "size=$fsize"
+      -F "mediatype=$mediatype" -F "uploadmediarequest=$umr"
+      -F "webwx_data_ticket=$wdt" -F "pass_ticket=$PASS_TICKET"
+    )
+
+    if [ "$chunks" -gt 1 ]; then
+      curl_opts+=( -F "id=WU_FILE_0" -F "chunk=$i" -F "chunks=$chunks" )
+      tmp=$(mktemp)
+      tail -c +$((offset+1)) "$file" 2>/dev/null | head -c "$clen" > "$tmp"
+      curl_opts+=( -F "filename=@$tmp;filename=$fname" )
+    else
+      curl_opts+=( -F "filename=@$file;filename=$fname" )
+    fi
+
+    rv=$(curl "${curl_opts[@]}" "https://$fh/cgi-bin/mmwebwx-bin/webwxuploadmedia?f=json")
+    [ -n "$tmp" ] && rm -f "$tmp" && tmp=""
+    local ret=$(jq -r '.BaseResponse.Ret//-1' <<<"$rv")
+    if [ "$ret" != 0 ]; then
+      echo "ERR: upload failed at chunk $i/$chunks, Ret=$ret" >&2
+      return 1
+    fi
+
+    mid=$(jq -r '.MediaId' <<<"$rv")
+    
     i=$((i+1))
     offset=$((offset + clen))
   done
+
   echo "$fname"$'\t'"$fsize"$'\t'"$fext"$'\t'"$mid"
 }
 
